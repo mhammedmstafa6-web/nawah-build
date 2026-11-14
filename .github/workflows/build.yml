@@ -75,11 +75,11 @@ jobs:
             # (tauri-apps/tauri#14681); NSIS covers the same users.
             args: "--bundles nsis"
           - name: "macOS Apple silicon"
-            runner: "macos-14"
+            runner: "macos-15"
             target: "aarch64-apple-darwin"
             args: "--bundles app,dmg"
           - name: "macOS Intel"
-            runner: "macos-13"
+            runner: "macos-15-intel"
             target: "x86_64-apple-darwin"
             args: "--bundles app,dmg"
     runs-on: ${{ matrix.runner }}
