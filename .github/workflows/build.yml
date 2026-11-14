@@ -77,11 +77,11 @@ jobs:
           - name: "macOS Apple silicon"
             runner: "macos-15"
             target: "aarch64-apple-darwin"
-            args: "--bundles app,dmg"
+            args: "--bundles app,dmg -- --no-default-features --features tauri-runtime,browser-child"
           - name: "macOS Intel"
             runner: "macos-15-intel"
             target: "x86_64-apple-darwin"
-            args: "--bundles app,dmg"
+            args: "--bundles app,dmg -- --no-default-features --features tauri-runtime,browser-child"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
