@@ -1,0 +1,158 @@
+# Builds Nawah for Linux, Windows and macOS from the private source repo and
+# drafts the release here, where the in-app updater reads it. The source is
+# checked out with a read-only deploy key; nothing from it is committed here.
+name: Build Nawah
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must match the app version, e.g. v1.0.0)"
+        required: true
+      ref:
+        description: "Source branch or commit"
+        required: true
+        default: main
+
+env:
+  RUST_BACKTRACE: short
+  HUSKY: 0
+
+concurrency:
+  group: nawah-release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MohammedMoustafa557/nawah
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.NAWAH_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - id: tag
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Tag matches the app version
+        run: |
+          app="v$(node -p 'require("./src-tauri/tauri.conf.json").version')"
+          if [ "$app" != "${{ steps.tag.outputs.tag }}" ]; then
+            echo "Tag ${{ steps.tag.outputs.tag }} does not match app version $app"; exit 1
+          fi
+      - id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "Nawah ${TAG#v}" --notes "Nawah ${TAG#v}" --repo "$GITHUB_REPOSITORY"
+          fi
+          echo "release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name==\"$TAG\") | .id" | head -1)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: draft
+    name: Build ${{ matrix.name }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Linux x64"
+            runner: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-gnu"
+            args: "--bundles deb,appimage"
+          - name: "Windows x64"
+            runner: "windows-2022"
+            target: "x86_64-pc-windows-msvc"
+            # MSI needs light.exe, which fails with externalBin
+            # (tauri-apps/tauri#14681); NSIS covers the same users.
+            args: "--bundles nsis"
+          - name: "macOS Apple silicon"
+            runner: "macos-14"
+            target: "aarch64-apple-darwin"
+            args: "--bundles app,dmg"
+          - name: "macOS Intel"
+            runner: "macos-13"
+            target: "x86_64-apple-darwin"
+            args: "--bundles app,dmg"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MohammedMoustafa557/nawah
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.NAWAH_SOURCE_SSH_KEY }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vendor/waveterm/go.mod
+          cache-dependency-path: vendor/waveterm/go.sum
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: ${{ matrix.target }}
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libasound2-dev
+
+      - run: pnpm install --frozen-lockfile
+
+      # The sidecars (nawah-mcp, nawah-computer-helper, nawah-cli) for this
+      # target, staged where bundle.externalBin expects them.
+      - name: Stage sidecars
+        shell: bash
+        run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+
+      # RTK (the token saver's command-output filter) rides inside the app.
+      - name: Stage RTK
+        shell: bash
+        run: pnpm tauri:prepare-rtk --target ${{ matrix.target }}
+
+      # Unsigned macOS for now (no Apple Developer ID yet): no Team-ID pins,
+      # so computer use stays off on macOS until the app is signed.
+      - name: Build and upload to the draft release
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          NAWAH_SKIP_SIDECAR: "1"
+          TAURI_TARGET_TRIPLE: ${{ matrix.target }}
+          NODE_OPTIONS: --max-old-space-size=4096
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NAWAH_SENTRY_DSN: ${{ secrets.NAWAH_SENTRY_DSN }}
+          NAWAH_SUPABASE_URL: ${{ secrets.NAWAH_SUPABASE_URL }}
+          NAWAH_SUPABASE_ANON_KEY: ${{ secrets.NAWAH_SUPABASE_ANON_KEY }}
+        with:
+          releaseId: ${{ needs.draft.outputs.release_id }}
+          tagName: ${{ needs.draft.outputs.tag }}
+          releaseDraft: true
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} ${{ matrix.args }}
+          includeUpdaterJson: true
+          retryAttempts: 2
